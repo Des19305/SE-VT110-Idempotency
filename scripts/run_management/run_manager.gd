@@ -21,16 +21,32 @@ var records_dir := "user://runs"
 var clock: Callable = func() -> int: return int(Time.get_unix_time_from_system())
 var current_run := {}
 var last_run := {}
+## Successful start results are cached only for this RunManager/game session.
+var _request_cache: Dictionary = {}
+var _run_id_sequence := 0
+var _replay_request_sequence := 0
 
 
-func start_new_run(seed: int, config: Dictionary) -> Dictionary:
+func start_new_run(request_id: String, seed: int, config: Dictionary) -> Dictionary:
+	if request_id.strip_edges().is_empty():
+		return _rejected(seed, "Request ID must not be empty")
+
+	# Copy and normalize before comparing so caller mutations cannot change the
+	# payload associated with a successful request.
+	var run_config := _with_defaults(config)
+	var payload := {"seed": seed, "config": run_config.duplicate(true)}
+	if _request_cache.has(request_id):
+		var cached: Dictionary = _request_cache[request_id]
+		if cached["payload"] == payload:
+			return cached["result"].duplicate(true)
+		return _rejected(seed, "Request ID already used with a different payload")
+
 	if current_run.get("status", "") == "in_progress":
 		return _rejected(seed, "A run is already in progress")
 	var config_error := RunConfigValidator.validate(seed, config)
 	if config_error != "":
 		return _rejected(seed, config_error)
 
-	var run_config := _with_defaults(config)
 	var generated := _generate_valid_dungeon(seed, run_config)
 	if generated["error"] != "":
 		return _rejected(seed, generated["error"])
@@ -40,10 +56,15 @@ func start_new_run(seed: int, config: Dictionary) -> Dictionary:
 	if save_error != "":
 		return _rejected(seed, save_error)
 
+	var result := {"ok": true, "error": "", "seed": seed, "dungeon": generated["dungeon"]}
+	_request_cache[request_id] = {
+		"payload": payload.duplicate(true),
+		"result": result.duplicate(true),
+	}
 	current_run = record
 	last_run = record
 	run_started.emit(seed, generated["dungeon"])
-	return {"ok": true, "error": "", "seed": seed, "dungeon": generated["dungeon"]}
+	return result.duplicate(true)
 
 
 ## Starts a fresh run with the previous run's seed and configuration.
@@ -51,7 +72,7 @@ func start_new_run(seed: int, config: Dictionary) -> Dictionary:
 func replay_last_run() -> Dictionary:
 	if last_run.is_empty():
 		return {"ok": false, "error": "No previous run to replay", "seed": 0, "dungeon": {}}
-	return start_new_run(last_run["seed"], last_run["config"])
+	return start_new_run(_next_replay_request_id(), last_run["seed"], last_run["config"])
 
 
 func end_run(won: bool, reason: String) -> void:
@@ -85,7 +106,7 @@ func _generate_valid_dungeon(seed: int, run_config: Dictionary) -> Dictionary:
 
 func _new_record(seed: int, run_config: Dictionary, now: int) -> Dictionary:
 	return {
-		"run_id": "%d_%d" % [now, seed],
+		"run_id": _next_run_id(now, seed),
 		"seed": seed,
 		"config": run_config,
 		"generation_version": GENERATION_VERSION,
@@ -95,6 +116,26 @@ func _new_record(seed: int, run_config: Dictionary, now: int) -> Dictionary:
 		"won": false,
 		"reason": "",
 	}
+
+
+func _next_run_id(now: int, seed: int) -> String:
+	var candidate := ""
+	while true:
+		_run_id_sequence += 1
+		candidate = "%d_%d_%d" % [now, seed, _run_id_sequence]
+		if not FileAccess.file_exists(records_dir.path_join(candidate + ".json")):
+			return candidate
+	return candidate
+
+
+func _next_replay_request_id() -> String:
+	var candidate := ""
+	while true:
+		_replay_request_sequence += 1
+		candidate = "__replay__%d" % _replay_request_sequence
+		if not _request_cache.has(candidate):
+			return candidate
+	return candidate
 
 
 func _repository() -> RunRecordRepository:
