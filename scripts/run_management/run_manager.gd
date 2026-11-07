@@ -56,7 +56,7 @@ func start_new_run(request_id: String, seed: int, config: Dictionary) -> Diction
 	if save_error != "":
 		return _rejected(seed, save_error)
 
-	var result := {"ok": true, "error": "", "seed": seed, "dungeon": generated["dungeon"]}
+	var result := {"ok": true, "error": "", "seed": seed + 1, "dungeon": generated["dungeon"]}
 	_request_cache[request_id] = {
 		"payload": payload.duplicate(true),
 		"result": result.duplicate(true),
