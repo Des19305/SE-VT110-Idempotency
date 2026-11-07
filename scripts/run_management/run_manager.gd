@@ -63,7 +63,7 @@ func start_new_run(request_id: String, seed: int, config: Dictionary) -> Diction
 	}
 	current_run = record
 	last_run = record
-	run_started.emit(seed, generated["dungeon"])
+	run_started.emit(seed, generated["dungeon"].duplicate(true))
 	return result.duplicate(true)
 
 

@@ -19,10 +19,12 @@ var manager: Node
 var records_dir: String
 var started_events: Array = []
 var ended_events: Array = []
+var signal_mutation_listener_called := false
 
 
 func before_each() -> void:
 	records_dir = "user://test_runs/%d" % Time.get_ticks_usec()
+	signal_mutation_listener_called = false
 	manager = RunManager.new()
 	manager.records_dir = records_dir
 	manager.run_started.connect(func(seed_value, dungeon): started_events.append([seed_value, dungeon]))
@@ -34,6 +36,61 @@ func after_each() -> void:
 	_remove_dir("user://test_runs")
 
 
+
+class FaultInjectionRepository:
+	extends "res://scripts/run_management/run_record_repository.gd"
+	var failure_stage := ""
+	var failure_injected := false
+	var record_existed_at_failure := false
+	var partial_write_observed := false
+	var staged_pointer_complete := false
+	var expected_old_pointer := ""
+	var old_pointer_backed_up := false
+
+	func _write(file_name: String, record: Dictionary) -> String:
+		if failure_stage == "temp_write" and file_name.begins_with("last_run"):
+			failure_injected = true
+			record_existed_at_failure = FileAccess.file_exists(records_dir.path_join(record["run_id"] + ".json"))
+			var file := FileAccess.open(records_dir.path_join(file_name), FileAccess.WRITE)
+			if file == null:
+				return "Fixture could not open staged pointer"
+			file.store_string("{\"run_id\":")
+			file.flush()
+			var write_error := file.get_error()
+			file.close()
+			var staged_content := FileAccess.get_file_as_string(records_dir.path_join(file_name))
+			partial_write_observed = staged_content == "{\"run_id\":"
+			staged_pointer_complete = staged_content.begins_with("{") and staged_content.ends_with("}")
+			return "Injected staged pointer write failure"
+		return super._write(file_name, record)
+
+	func _replace_pointer_file(temp_path: String, pointer_path: String) -> String:
+		if failure_stage == "replace":
+			failure_injected = true
+			record_existed_at_failure = _record_file_exists_for_test()
+			var staged_content := FileAccess.get_file_as_string(temp_path)
+			staged_pointer_complete = FileAccess.file_exists(temp_path) and staged_content.begins_with("{") and staged_content.ends_with("}")
+			var backup_path := pointer_path + ".bak"
+			old_pointer_backed_up = FileAccess.file_exists(backup_path) and FileAccess.get_file_as_string(backup_path) == expected_old_pointer
+			return "Injected pointer replacement failure"
+		return super._replace_pointer_file(temp_path, pointer_path)
+
+	func _record_file_exists_for_test() -> bool:
+		var dir := DirAccess.open(records_dir)
+		if dir == null:
+			return false
+		for file_name in dir.get_files():
+			if file_name.ends_with(".json") and file_name != LAST_RUN_FILE:
+				return true
+		return false
+
+
+class FaultInjectionRunManager:
+	extends "res://scripts/run_management/run_manager.gd"
+	var repository_override
+
+	func _repository() -> RunRecordRepository:
+		return repository_override
 # --- happy path -------------------------------------------------------------
 
 func test_start_returns_valid_dungeon_and_emits_signal() -> void:
@@ -204,6 +261,80 @@ func test_storage_failure_blocks_run_start() -> void:
 	check_eq(started_events.size(), 0, "run_started count")
 
 
+
+func test_persistence_temp_pointer_write_failure_rolls_back_record_and_keeps_old_pointer() -> void:
+	var repo = _use_failure_injection("temp_write")
+	var pointer_path := records_dir.path_join("last_run.json")
+	var old_pointer := "{\"run_id\":\"previous\",\"marker\":\"preserve-me\"}"
+	_write_text(pointer_path, old_pointer)
+	var result: Dictionary = manager.start_new_run("request-temp-write-failure", 31, CONFIG)
+	check(repo.failure_injected, "fixture must fail while writing the staged pointer")
+	check(repo.record_existed_at_failure, "record must already be written when staged-pointer failure is injected")
+	check(repo.partial_write_observed, "fixture must write partial pointer bytes before returning the injected error")
+	check(not repo.staged_pointer_complete, "fixture must stop the staged-pointer write before completion")
+	check(not result.get("ok", false), "staged-pointer write failure must reject run start")
+	check_eq(_record_ids().size(), 0, "failed request record rollback")
+	check_eq(FileAccess.get_file_as_string(pointer_path), old_pointer, "old pointer content after staged-write failure")
+	check_eq(started_events.size(), 0, "run_started after staged-write failure")
+	repo.failure_stage = ""
+	var retry: Dictionary = manager.start_new_run("request-temp-write-failure", 31, CONFIG)
+	check(retry.get("ok", false), "retry must be accepted after persistence failure: %s" % retry.get("error", "missing result"))
+	check_eq(_record_ids().size(), 1, "record count after retry")
+	check_eq(started_events.size(), 1, "run_started after retry")
+
+
+func test_persistence_pointer_replacement_failure_rolls_back_record_and_keeps_old_pointer() -> void:
+	var repo = _use_failure_injection("replace")
+	var pointer_path := records_dir.path_join("last_run.json")
+	var old_pointer := "{\"run_id\":\"previous\",\"marker\":\"preserve-me\"}"
+	_write_text(pointer_path, old_pointer)
+	repo.expected_old_pointer = old_pointer
+	var result: Dictionary = manager.start_new_run("request-replace-failure", 32, CONFIG)
+	check(repo.failure_injected, "fixture must fail at the pointer replacement step")
+	check(repo.record_existed_at_failure, "record must already be written when replacement failure is injected")
+	check(repo.staged_pointer_complete, "a complete staged pointer must exist before replacement failure")
+	check(repo.old_pointer_backed_up, "old pointer must be moved to backup before promotion failure is injected")
+	check(not result.get("ok", false), "pointer replacement failure must reject run start")
+	check_eq(_record_ids().size(), 0, "failed request record rollback")
+	check_eq(FileAccess.get_file_as_string(pointer_path), old_pointer, "old pointer content after replacement failure")
+	check_eq(started_events.size(), 0, "run_started after replacement failure")
+	repo.failure_stage = ""
+	var retry: Dictionary = manager.start_new_run("request-replace-failure", 32, CONFIG)
+	check(retry.get("ok", false), "retry must be accepted after persistence failure: %s" % retry.get("error", "missing result"))
+	check_eq(_record_ids().size(), 1, "record count after retry")
+	check_eq(started_events.size(), 1, "run_started after retry")
+
+
+func test_signal_listener_and_caller_mutations_do_not_change_cached_result() -> void:
+	manager.run_started.connect(_mutate_signal_dungeon)
+	var first: Dictionary = manager.start_new_run("request-signal-mutation", 33, CONFIG)
+	var original_snapshot: Dictionary = first.duplicate(true)
+	check(first.get("ok", false), "first request should start")
+	check(signal_mutation_listener_called, "mutating signal listener must run")
+	check(not first["dungeon"].has("listener_mutation_probe"), "listener must not mutate caller result dictionary")
+	check(not first["dungeon"]["tiles"].has("listener_nested_probe"), "listener must not mutate nested caller result data")
+	first["dungeon"]["caller_mutation_probe"] = true
+	first["dungeon"]["tiles"].append("caller_nested_probe")
+	var retry: Dictionary = manager.start_new_run("request-signal-mutation", 33, CONFIG)
+	check(retry == original_snapshot, "retry result must match pre-caller-mutation snapshot")
+	check(not retry["dungeon"].has("caller_mutation_probe"), "caller dictionary mutation must not reach cache")
+	check(not retry["dungeon"]["tiles"].has("caller_nested_probe"), "caller nested mutation must not reach cache")
+	check_eq(_record_ids().size(), 1, "record count after retry")
+	check_eq(started_events.size(), 1, "run_started count after retry")
+
+
+func test_run_ids_are_unique_for_sequential_runs_with_fixed_clock_and_seed() -> void:
+	manager.clock = func() -> int: return 123456789
+	var run_ids: Array[String] = []
+	for index in range(3):
+		var result: Dictionary = manager.start_new_run("request-fixed-clock-%d" % index, 34, CONFIG)
+		check(result.get("ok", false), "sequential run %d should start: %s" % [index, result.get("error", "missing result")])
+		run_ids.append(str(manager.current_run["run_id"]))
+		if index < 2:
+			manager.end_run(false, "fixed-clock sequence")
+	check_eq(run_ids.size(), 3, "run ID sample count")
+	check(run_ids[0] != run_ids[1] and run_ids[1] != run_ids[2] and run_ids[0] != run_ids[2], "same clock and seed must produce distinct sequential run IDs")
+	check_eq(_record_ids().size(), 3, "record count for fixed-clock sequence")
 # --- request idempotency contract (expected to fail until RunManager supports it) ---
 
 func test_idempotency_new_request_creates_run() -> void:
@@ -309,6 +440,33 @@ func test_idempotency_rejects_invalid_payload_without_claiming_request_id() -> v
 	check_eq(started_events.size(), 1, "run_started count after valid retry")
 
 
+
+func _mutate_signal_dungeon(_seed: int, dungeon: Dictionary) -> void:
+	signal_mutation_listener_called = true
+	dungeon["listener_mutation_probe"] = true
+	if dungeon.get("tiles") is Array:
+		dungeon["tiles"].append("listener_nested_probe")
+
+
+func _use_failure_injection(stage: String):
+	manager.free()
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(records_dir))
+	var fault_manager := FaultInjectionRunManager.new()
+	fault_manager.records_dir = records_dir
+	var repo := FaultInjectionRepository.new(records_dir)
+	repo.failure_stage = stage
+	fault_manager.repository_override = repo
+	manager = fault_manager
+	manager.run_started.connect(func(seed_value, dungeon): started_events.append([seed_value, dungeon]))
+	manager.run_ended.connect(func(won, reason): ended_events.append([won, reason]))
+	return repo
+
+
+func _write_text(path: String, content: String) -> void:
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(content)
+	file.flush()
+	file.close()
 # --- helpers ----------------------------------------------------------------
 
 func _expect_rejected(result: Dictionary, expected_error: String) -> void:
